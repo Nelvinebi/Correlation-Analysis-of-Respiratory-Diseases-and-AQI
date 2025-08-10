@@ -1,0 +1,232 @@
+"""
+Correlation-Analysis-of-Respiratory-Diseases-and-AQI (synthetic data)
+
+Generates synthetic data (>100 samples) linking AQI and respiratory disease incidence,
+computes correlations (Pearson, Spearman), fits linear regression and Poisson regression,
+and saves dataset and plots.
+
+Outputs:
+ - ./data/resp_aqi_synthetic.csv
+ - ./data/resp_aqi_synthetic.xlsx
+ - ./plots/scatter_aqi_cases.png
+ - ./plots/corr_matrix.png
+ - ./plots/regression_diagnostics.png
+
+Dependencies:
+ pip install numpy pandas matplotlib seaborn scikit-learn statsmodels openpyxl
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+from scipy.stats import pearsonr, spearmanr
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+def generate_synthetic_data(n=500, random_state=42):
+    """Generate synthetic dataset linking AQI and respiratory disease incidence."""
+    rng = np.random.default_rng(random_state)
+    # Time (daily) and location features
+    start_date = pd.to_datetime("2024-01-01")
+    dates = start_date + pd.to_timedelta(rng.integers(0, 365, size=n), unit="D")
+    # Demographics / contextual features
+    population = rng.integers(5000, 200000, size=n)  # population in area
+    pop_density = rng.uniform(100, 10000, size=n)    # persons/km2
+    median_age = rng.normal(30, 8, size=n).clip(5, 90)
+    smoking_rate = rng.uniform(0.05, 0.35, size=n)   # fraction
+    healthcare_index = rng.uniform(0.2, 1.0, size=n) # 0 (poor) to 1 (excellent)
+    # Meteorology (affects pollution and disease spread)
+    temperature_C = rng.normal(25, 6, size=n)
+    humidity = np.clip(rng.normal(0.6, 0.15, size=n), 0.1, 0.99)
+    # Air quality components and composite AQI (synthetic but plausible ranges)
+    pm25 = np.abs(rng.normal(30, 20, size=n))  # ug/m3
+    pm10 = np.abs(rng.normal(50, 30, size=n))  # ug/m3
+    no2 = np.abs(rng.normal(25, 15, size=n))   # ppb
+    so2 = np.abs(rng.normal(5, 3, size=n))
+    # Create an AQI-like composite roughly dominated by PM2.5/PM10
+    aqi = (0.6 * (pm25 / (pm25.max()+1) * 200) +
+           0.3 * (pm10 / (pm10.max()+1) * 150) +
+           0.1 * (no2 / (no2.max()+1) * 100))
+    aqi = aqi + rng.normal(scale=5.0, size=n)  # noise
+    aqi = np.clip(aqi, 0, None)
+
+    # Generate expected respiratory cases (per day) via a Poisson-like process
+    # baseline incidence scales with population and healthcare; pollution increases risk.
+    # Use a log-linear formulation for expected rate:
+    # log(lambda) = intercept + beta_aqi * aqi + beta_smoke*smoking_rate + beta_age*median_age + ...
+    intercept = -6.0
+    beta_aqi = 0.02         # per AQI unit
+    beta_smoke = 1.5        # per fraction
+    beta_age = 0.01         # per year
+    beta_pop = 1e-5         # per person
+    beta_health = -1.0      # better healthcare -> fewer cases
+    beta_humid = 0.5        # humidity effect
+    linear_term = (intercept +
+                   beta_aqi * aqi +
+                   beta_smoke * smoking_rate +
+                   beta_age * median_age +
+                   beta_pop * population +
+                   beta_health * healthcare_index +
+                   beta_humid * humidity)
+    # convert to expected cases and draw counts
+    expected_cases = np.exp(linear_term) * (rng.uniform(0.8, 1.2, size=n))  # some extra noise
+    # ensure not extremely large
+    expected_cases = np.clip(expected_cases, 0, 500)
+    # Draw from Poisson with mean = expected_cases
+    # To avoid zero-inflation in extremely small lambda, add small epsilon
+    eps = 1e-6
+    respiratory_cases = rng.poisson(lam=expected_cases + eps)
+
+    df = pd.DataFrame({
+        "date": dates,
+        "population": population,
+        "pop_density": np.round(pop_density, 1),
+        "median_age": np.round(median_age, 1),
+        "smoking_rate": np.round(smoking_rate, 3),
+        "healthcare_index": np.round(healthcare_index, 3),
+        "temperature_C": np.round(temperature_C, 2),
+        "humidity": np.round(humidity, 3),
+        "pm25_ug_m3": np.round(pm25, 3),
+        "pm10_ug_m3": np.round(pm10, 3),
+        "no2_ppb": np.round(no2, 3),
+        "so2_ppb": np.round(so2, 3),
+        "AQI": np.round(aqi, 3),
+        "respiratory_cases": respiratory_cases,
+        "expected_cases": np.round(expected_cases, 3)
+    })
+
+    # Ensure >100 points
+    if df.shape[0] < 100:
+        raise ValueError("Generated dataset has fewer than 100 points. Increase n.")
+
+    return df
+
+def correlation_and_models(df, outdir="outputs"):
+    os.makedirs(outdir, exist_ok=True)
+    os.makedirs(os.path.join(outdir, "plots"), exist_ok=True)
+
+    # Basic correlations: Pearson & Spearman between AQI and respiratory cases
+    pearson_r, pearson_p = pearsonr(df["AQI"], df["respiratory_cases"])
+    spearman_r, spearman_p = spearmanr(df["AQI"], df["respiratory_cases"])
+
+    print("Pearson correlation (AQI vs cases): r = {:.3f}, p = {:.3e}".format(pearson_r, pearson_p))
+    print("Spearman correlation (AQI vs cases): rho = {:.3f}, p = {:.3e}".format(spearman_r, spearman_p))
+
+    # Correlation matrix (select numeric columns of interest)
+    cols = ["AQI", "pm25_ug_m3", "pm10_ug_m3", "no2_ppb", "respiratory_cases", "population", "smoking_rate", "healthcare_index"]
+    corr_mat = df[cols].corr(method="pearson")
+    print("\nCorrelation matrix (pearson):\n", corr_mat.round(3))
+    corr_mat.to_csv(os.path.join(outdir, "correlation_matrix.csv"))
+
+    # Scatter plot AQI vs cases (with jitter for visibility)
+    plt.figure(figsize=(7,5))
+    sns.scatterplot(x="AQI", y="respiratory_cases", data=df, alpha=0.7)
+    sns.regplot(x="AQI", y="respiratory_cases", data=df, scatter=False, lowess=True, color="red")
+    plt.xlabel("AQI (synthetic)")
+    plt.ylabel("Respiratory cases (count)")
+    plt.title("AQI vs Respiratory Cases")
+    plt.tight_layout()
+    scatter_path = os.path.join(outdir, "plots", "scatter_aqi_cases.png")
+    plt.savefig(scatter_path, dpi=150)
+    plt.close()
+    print("Saved scatter plot:", scatter_path)
+
+    # Correlation heatmap
+    plt.figure(figsize=(8,6))
+    sns.heatmap(corr_mat, annot=True, fmt=".2f", cmap="vlag", center=0)
+    plt.title("Correlation matrix (selected variables)")
+    plt.tight_layout()
+    cmap_path = os.path.join(outdir, "plots", "corr_matrix.png")
+    plt.savefig(cmap_path, dpi=150)
+    plt.close()
+    print("Saved correlation matrix plot:", cmap_path)
+
+    # Linear regression: predict respiratory_cases from AQI (simple baseline)
+    X = df[["AQI"]].values.reshape(-1,1)
+    y = df["respiratory_cases"].values
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    lr = LinearRegression()
+    lr.fit(X_train, y_train)
+    y_pred = lr.predict(X_test)
+    print("\nLinear regression (cases ~ AQI):")
+    print(" coef (AQI) = {:.4f}, intercept = {:.4f}".format(lr.coef_[0], lr.intercept_))
+    print(" RMSE = {:.3f}, R2 = {:.3f}".format(mean_squared_error(y_test, y_pred, squared=False), r2_score(y_test, y_pred)))
+
+    # Poisson regression (GLM) using statsmodels: log(expected_cases) ~ AQI + smoking_rate + median_age + healthcare_index + population
+    # Add small constant to population scaling to avoid numerical issues
+    df_glm = df.copy()
+    # create formula
+    formula = "respiratory_cases ~ AQI + smoking_rate + median_age + healthcare_index + np.log(population)"
+    try:
+        glm_poisson = smf.glm(formula=formula, data=df_glm, family=sm.families.Poisson()).fit()
+        print("\nPoisson GLM summary:")
+        print(glm_poisson.summary().tables[1])  # coefficients table
+        # save full summary
+        with open(os.path.join(outdir, "poisson_glm_summary.txt"), "w") as f:
+            f.write(glm_poisson.summary().as_text())
+        print("Saved Poisson GLM summary.")
+    except Exception as e:
+        print("Poisson GLM failed:", e)
+
+    # Regression diagnostics: observed vs fitted (Poisson fitted values if available else LR)
+    plt.figure(figsize=(7,5))
+    if 'glm_poisson' in locals():
+        fitted = glm_poisson.fittedvalues
+        plt.scatter(fitted, df["respiratory_cases"], alpha=0.6)
+        plt.xlabel("Fitted cases (Poisson GLM)")
+    else:
+        fitted = lr.predict(df[["AQI"]])
+        plt.scatter(fitted, df["respiratory_cases"], alpha=0.6)
+        plt.xlabel("Fitted cases (Linear Regression)")
+    plt.ylabel("Observed respiratory cases")
+    plt.title("Observed vs Fitted - Regression Diagnostics")
+    plt.plot([fitted.min(), fitted.max()], [fitted.min(), fitted.max()], color="red", linestyle="--")
+    diag_path = os.path.join(outdir, "plots", "regression_diagnostics.png")
+    plt.tight_layout()
+    plt.savefig(diag_path, dpi=150)
+    plt.close()
+    print("Saved regression diagnostics plot:", diag_path)
+
+    # Save results summary
+    summary = {
+        "pearson_r": pearson_r, "pearson_p": pearson_p,
+        "spearman_r": spearman_r, "spearman_p": spearman_p,
+        "linear_coef": float(lr.coef_[0]), "linear_intercept": float(lr.intercept_),
+        "linear_rmse": float(mean_squared_error(y_test, y_pred, squared=False)),
+        "linear_r2": float(r2_score(y_test, y_pred))
+    }
+    pd.Series(summary).to_csv(os.path.join(outdir, "summary_metrics.csv"))
+
+def save_dataset(df, outdir="outputs"):
+    os.makedirs(outdir, exist_ok=True)
+    os.makedirs(os.path.join(outdir, "data"), exist_ok=True)
+    csv_path = os.path.join(outdir, "data", "resp_aqi_synthetic.csv")
+    excel_path = os.path.join(outdir, "data", "resp_aqi_synthetic.xlsx")
+    df.to_csv(csv_path, index=False)
+    df.to_excel(excel_path, index=False)
+    print("Saved dataset CSV:", csv_path)
+    print("Saved dataset Excel:", excel_path)
+    return csv_path, excel_path
+
+def main():
+    # Generate data (n > 100)
+    n_samples = 500
+    df = generate_synthetic_data(n=n_samples, random_state=2025)
+    print("Sample rows:\n", df.head())
+
+    # Save dataset
+    csv_path, excel_path = save_dataset(df, outdir="outputs")
+
+    # Run correlation analysis and models
+    correlation_and_models(df, outdir="outputs")
+
+    print("\nAll outputs saved under ./outputs/ (plots, data, summaries).")
+
+if __name__ == "__main__":
+    main()
